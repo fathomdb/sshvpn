@@ -1,7 +1,7 @@
 SSH VPN
 =======
 
-A script to make it easier to use OpenSSH "VPN"s.
+A script to make it easier to use OpenSSH "VPN"s.  Background in my [blog post](http://blog.justinsb.com/blog/2013/10/21/the-best-vpn-is-the-one-you-use/)
 
 OpenSSH supports tunnels, over which you can route some or all of your network traffic.  Because it's over SSH, the traffic is encrypted.  Because it uses SSH, setup/key management is much easier.  If you have a server, this is a very easy way to get a quick VPN-like experience.  Using OpenSSH directly can be a little painful.  This script makes it easier.
 
