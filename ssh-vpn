@@ -1,0 +1,363 @@
+#!/usr/bin/python -u
+
+# vim: tabstop=2 expandtab shiftwidth=2 softtabstop=2
+
+import ConfigParser
+import os
+import os.path
+import subprocess
+import sys
+import StringIO
+import time
+
+def exiterr(code, message):
+  sys.stderr.write(message + '\n')
+  sys.exit(code)
+
+def parse_tunnels(out):
+  tunnels = []
+  for line in out.split('\n'):
+    tokens = line.split()
+    if len(tokens) < 3:
+      continue
+    device = tokens[1].strip().strip(':')
+    if device.startswith('tun'):
+      tunnels.append(device)
+  return tunnels
+
+class KeyValueParser:
+  def __init__(self, filename):
+    self.filename = filename
+    self.config = ConfigParser.RawConfigParser()
+
+  def read(self):
+    with open(self.filename, 'r') as f:
+      contents = f.read()
+    contents = '[DUMMY]\n' + contents
+    f = StringIO.StringIO(contents)
+    self.config.readfp(f, self.filename)
+
+  def get(self, key):
+    if 'DUMMY' not in self.config.sections():
+      return None
+    if not self.config.has_option('DUMMY', key):
+      return False
+    return self.config.get('DUMMY', key)
+
+class SshConfig:
+  def __init__(self, user, host):
+    self.user = user
+    self.host = host
+  
+  def run(self, message, cmd):
+    args = []
+    args.append('ssh')
+    args.append(self.user + '@' + self.host)
+    # Don't use persistent connections (it's faster, but causes problems when we switch networks)
+    args.extend(['-S', 'none'])
+    args.extend(cmd)
+    return run_command(message, args)
+
+class VpnConfig:
+  def __init__(self, key):
+    self.key = key
+    self.config_file = os.path.join(config_dir, key)
+    self.state_file = os.path.join(state_dir, key)
+
+  def read_config(self):
+    if not os.path.isfile(self.config_file):
+      return False
+    self.config = KeyValueParser(self.config_file)
+    self.config.read()
+    ssh_user = self.config.get('ssh_user')
+    if not ssh_user:
+      ssh_user = os.getlogin()
+    ssh_host = self.config.get('server')
+    if not ssh_host:
+      sys.stderr.write('server not configured in %s\n' % self.config_file)
+      return False
+    self.ssh_config = SshConfig(ssh_user, ssh_host)
+
+    default_gateway = self.config.get('default_gateway')
+    if not default_gateway:
+      default_gateway = find_default_gateway()
+      if not default_gateway:
+        sys.stderr.write('default_gateway not configured in %s\n' % self.config_file)
+        return False
+      else:
+        print("Auto-configured default gateway as: " + default_gateway)
+    self.default_gateway = default_gateway
+
+    return True
+
+  def read_state(self):
+    self.state = ConfigParser.RawConfigParser()
+    if os.path.isfile(self.state_file):
+      self.state.read(self.state_file)
+
+  def is_up(self):
+    state_file = os.path.join(state_dir, self.key)
+    if not os.path.isfile(state_file):
+      return False
+    state = self.get_state('state')
+    return state == 'up'
+
+  def down(self):
+    device = self.get_state('local_device')
+    if device:
+      local_tunnels = self.list_local_tunnels()
+      if device in local_tunnels:
+        run_command('Shutting down local tunnel: ' + device, ['sudo', 'ip', 'link', 'del', device])
+      self.set_state('local_device', '')
+
+    remote_device = self.get_state('remote_device')
+    if remote_device:
+      remote_tunnels = self.list_remote_tunnels()
+      if remote_device in remote_tunnels:
+        self.ssh_config.run('Shutting down remote tunnel: ' + remote_device, ['sudo', 'ip', 'link', 'del', remote_device])
+      self.set_state('remote_device', '')
+
+    del_default_route(None, 'Deleting current default route')
+    add_default_route_via(None, 'Adding original default route', self.default_gateway)
+
+    self.set_state('state', 'down')
+    return True
+
+  def get_state(self, key):
+    self.read_state()
+    if not self.state.has_option(self.key, key):
+      return None
+    return self.state.get(self.key, key)
+
+  def set_state(self, key, value):
+    self.read_state()
+    section = self.key
+    if not section in self.state.sections():
+      self.state.add_section(section)
+    self.state.set(section, key, value)
+    with open(self.state_file, 'wb') as f:
+      self.state.write(f)
+
+  def list_local_tunnels(self):
+    # TODO: Support Mac
+    out, _ = run_command('Listing local tunnels', ['ip', '--oneline', 'link', 'show'])
+    return parse_tunnels(out)        
+
+  def list_remote_tunnels(self):
+    out, _ = self.ssh_config.run('Listing remote tunnels', ['sudo', 'ip', '--oneline', 'link', 'show'])
+    return parse_tunnels(out)
+
+  def up(self):
+    if self.is_up():
+      print 'Tunnel is already up'
+      return True
+    
+    self.down()
+
+    local_tunnels = self.list_local_tunnels()
+    local_id = None
+    for i in range(2, 255):
+      if not 'tun' + str(i) in local_tunnels:
+        local_id = i
+        break
+    if not local_id:
+      sys.stderr.write('Unable to find unused local tunnel device')
+      return False
+
+    remote_tunnels = self.list_remote_tunnels()
+    remote_id = None
+    for i in range(2, 255):
+      if not 'tun' + str(i) in remote_tunnels:
+        remote_id = i
+        break
+    if not remote_id:
+      sys.stderr.write('Unable to find unused remote tunnel device')
+      return False
+
+    print 'Using local tunnel tun%s and remote tunnel tun%s' % (local_id, remote_id)
+    
+    # We create the tunnel devices in advance, so we don't need root
+    remote_device = 'tun' + str(remote_id)
+    self.ssh_config.run('Creating tunnel device on server', ['sudo', 'ip', 'tuntap', 'add', 'dev', remote_device, 'mode', 'tun', 'user', self.ssh_config.user])
+    self.set_state('remote_device', remote_device)
+
+    local_user = os.getlogin()
+    local_device = 'tun' + str(local_id)
+    run_command('Creating local tunnel device', ['sudo', 'ip', 'tuntap', 'add', 'dev', local_device, 'mode', 'tun', 'user', local_user])
+    self.set_state('local_device', local_device)
+
+    proc = spawn_command('Starting tunnel', ['ssh', '-S', 'none', '-f', '-N', '-w%s:%s' % (local_id, remote_id), self.ssh_config.user + '@' + self.ssh_config.host])
+
+    time.sleep(2)
+
+    # TODO: Make configurable
+    local_cidr = '172.31.254.' + str(local_id) + '/24'
+    run_command('Bringing local link up', ['sudo', 'ip', 'link', 'set', local_device, 'up'])
+    run_command('Configuring local ip address', ['sudo', 'ip', 'addr', 'add', local_cidr, 'dev', local_device])
+    self.set_state('local_cidr', local_cidr)
+
+    remote_cidr = '172.31.254.1/24'
+    self.ssh_config.run('Bringing remote link up', ['sudo', 'ip', 'link', 'set', remote_device, 'up'])
+    self.ssh_config.run('Configuring remote ip address', ['sudo', 'ip', 'addr', 'add', remote_cidr, 'dev', remote_device])
+    self.set_state('remote_cidr', remote_cidr)
+
+    # Dump some diagnostics
+    # sudo ip link show ${LOCAL_TUN}
+    # ssh  ${SSHUSER}@${SERVER} sudo ip link show ${REMOTE_TUN}
+    # ssh ${SSHUSER}@${SERVER} sudo ip tuntap show dev ${REMOTE_TUN}
+    # sudo ip tuntap show ${LOCAL_TUN}
+
+    run_command('Pinging the remote IP', ['ping', '-c', '3', '172.31.254.1'])
+
+    # Enable local forwarding / proxying
+	  # TODO: Integrate with applyd
+    # TODO: Delete the rules when we're done
+    add_iptables_rule(self.ssh_config, 'Enabling IPv4 NAT', 'nat', '-A POSTROUTING -s 172.31.254.0/24 ! -d 172.31.254.0/24 -j MASQUERADE')
+
+    add_iptables_rule(self.ssh_config, 'Enabling IPv4 forwarding to tunnel device', 'filter', '-A FORWARD -i tun2 -j ACCEPT')
+    add_iptables_rule(self.ssh_config, 'Enabling IPv4 forwarding from tunnel device', 'filter', '-A FORWARD -o tun2 -j ACCEPT')
+
+    # TODO: Support IPv6    
+    #ssh ${SSHUSER}@${SERVER} sudo ip6tables -A FORWARD -o ${REMOTE_TUN} -j ACCEPT
+    #ssh ${SSHUSER}@${SERVER} sudo ip6tables -A FORWARD -i ${REMOTE_TUN} -j ACCEPT
+	  #ssh ${SSHUSER}@${SERVER} sudo ip -6 neigh add proxy ${PREFIX}:${IP} dev eth0
+
+    # TODO: Make configurable
+    # TODO: Save local route
+    add_route_via(None, 'Adding a route for the VPN server', self.ssh_config.host, self.default_gateway)
+    del_default_route(None, 'Deleting current default route')
+    add_default_route_dev(None, 'Adding default route via tunnel', local_device)
+
+    self.set_state('state', 'up')
+
+    return True
+
+def run(ssh, message, cmd):
+  if ssh:
+    return ssh.run(message, cmd)
+  else:
+    return run_command(message, cmd)
+
+def list_iptables_rules(ssh, ruleset):
+  out, _ = run(ssh, 'Reading state of IP tables', ['sudo', 'iptables', '-t', ruleset, '--list-rules'])
+  return out.split('\n')
+
+def list_routes(ssh):
+  out, _ = run(ssh, 'Reading route table', ['sudo', 'ip', 'route'])
+  return out.split('\n')
+
+def find_default_gateway():
+  routes = list_routes(None)
+  for route in routes:
+    # Look for a line like 'default via 1.2.3.4 ...'
+    tokens = route.split()
+    if len(tokens) < 3:
+      continue
+    if tokens[0] != 'default':
+      continue
+    if tokens[1] != 'via':
+      continue
+    return tokens[2]
+  return None
+
+def add_iptables_rule(ssh, message, ruleset, rule):
+    rules = list_iptables_rules(ssh, ruleset)
+
+    if not rule in rules:
+      args = ['sudo', 'iptables', '-t', ruleset]
+      args.extend(rule.split())
+      run(ssh, 'Enabling IPv4 forwarding to tunnel device', args)
+
+def add_route_via(ssh, message, dest, via):
+  routes = list_routes(ssh)
+  for line in routes:
+    tokens = line.split()
+    if len(tokens) < 3:
+      continue
+    if tokens[0] != dest:
+      continue
+    if tokens[1] != 'via':
+      continue
+    if tokens[2] != via:
+      continue
+    return
+  run_command(message, ['sudo', 'ip', 'route', 'add', dist, 'via', via])
+
+def del_default_route(ssh, message):
+  routes = list_routes(ssh)
+  has_default = False
+  for route in routes:
+    tokens = route.split()
+    if len(tokens) < 3:
+      continue
+    if tokens[0] != 'default':
+      continue
+    has_default = True
+  if has_default:
+    run_command(message, ['sudo', 'ip', 'route', 'del', 'default'])
+
+def add_default_route_via(ssh, message, via):
+  run_command(message, ['sudo', 'ip', 'route', 'add', 'default', 'via', via])
+
+def add_default_route_dev(ssh, message, dev):
+  run_command(message, ['sudo', 'ip', 'route', 'add', 'default', 'dev', dev])
+
+def run_command(description, args, stdin='', **kwargs):
+  print description
+  print 'Running command: ' + ' '.join(args)
+
+  proc = subprocess.Popen(args,
+                          stdin=subprocess.PIPE, 
+                          stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE,
+                          **kwargs)
+
+  out, err = proc.communicate(input=stdin)
+  retcode = proc.returncode
+  if retcode:
+    print "Calling return error: " + ' '.join(args)
+    print "Output: " + out
+    print "Error: " + err
+    raise subprocess.CalledProcessError(retcode, args)
+  return out,err
+
+def spawn_command(description, args, **kwargs):
+  print description
+  #print 'Running command: ' + ' '.join(args)
+
+  proc = subprocess.Popen(args,
+                          stdin=subprocess.PIPE, 
+                          stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE,
+                          **kwargs)
+
+  return proc
+
+
+if len(sys.argv) < 3:
+  exiterr(1, 'Usage: %s [up|down] <configuration>' % sys.argv[0])
+
+action=sys.argv[1]
+config_key=sys.argv[2]
+config_dir = os.path.expanduser('~/.ssh/vpn/')
+config_file = os.path.join(config_dir, config_key)
+state_dir = os.path.join(config_dir, 'state')
+if not os.path.isdir(state_dir):
+  os.makedirs(state_dir)
+
+vpn = VpnConfig(config_key)
+
+if not vpn.read_config():
+  exiterr(1, 'Could not read config file: ' + config_file)
+
+if action == 'up':
+  success = vpn.up()
+elif action =='down':
+  success = vpn.down()
+else:
+  exiterr(1, 'Action not known (use up or down): ' + action)
+
+if success:
+  sys.exit(0)
+
+sys.exit(1)
