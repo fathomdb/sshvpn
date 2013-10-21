@@ -32,13 +32,15 @@ Replace <MYSERVERID> with the IP address of your server.  Note that you want to 
 
 You must be able to sudo on the server, without a password.
 
-You'll probably want to create a sudo file: ```/etc/sudoers.d/<yourusername>``` which looks like this:
+You'll probably want to create a sudo file on the server: ```/etc/sudoers.d/<yourusername>``` which looks like this:
 
 ```
 <yourusername> ALL= (ALL) NOPASSWD: ALL
 ```
 
-So now you should be able to do this without typing in a password: ```ssh ${SERVER} sudo date```
+Also on the server, you'll want to make sure your /etc/ssh/sshd_config has ```PermitTunnel yes```.  You need to ```/etc/init.d/ssh reload``` after you change this.
+
+To check, you should now be able to do this without typing in a password: ```ssh ${SERVER} sudo date```
 
 Finally, run the script itself (on your client):
 
@@ -54,7 +56,7 @@ When you're done with the VPN:
 ./ssh-vpn down myvpn
 ```
 
-```myvpn``` is just a key.  You should be able to have multiple VPN configurations.  It's not likely you'll want to.  Running multiple VPN tunnels at once will probably break and is also very unlikely to be useful.
+```myvpn``` is just an identifier.  You should be able to have multiple VPN configurations.  It's not likely you'll want to.  Running multiple VPN tunnels at once will probably break and is also very unlikely to be useful.
 
 Troubleshooting
 ===============
