@@ -82,7 +82,7 @@ class VpnConfig:
     if not default_gateway:
       default_gateway = self.get_state('default_gateway')
     if not default_gateway:
-      default_gateway = find_default_gateway()
+      default_gateway = find_default_gateway(4)
       if not default_gateway:
         sys.stderr.write('default_gateway not configured in %s\n' % self.config_file)
         return False
@@ -90,6 +90,19 @@ class VpnConfig:
         print("Auto-configured default gateway as: " + default_gateway)
         self.set_state('default_gateway', default_gateway)
     self.default_gateway = default_gateway
+
+    self.ipv6_prefix = self.config.get('ipv6_prefix')
+
+    ipv6_gateway = self.config.get('ipv6_gateway')
+    if not ipv6_gateway:
+      ipv6_gateway = self.get_state('ipv6_gateway')
+    if not ipv6_gateway:
+      ipv6_gateway = find_default_gateway(6)
+      # It's very common not to have IPv6, don't treat as error!
+      if ipv6_gateway:
+        print("Auto-configured default ipv6 gateway as: " + ipv6_gateway)
+        self.set_state('ipv6_gateway', ipv6_gateway)
+    self.ipv6_gateway = ipv6_gateway
 
     return True
 
@@ -120,8 +133,12 @@ class VpnConfig:
         self.ssh_config.run('Shutting down remote tunnel: ' + remote_device, ['sudo', 'ip', 'link', 'del', remote_device])
       self.set_state('remote_device', '')
 
-    del_default_route(None, 'Deleting current default route')
-    add_default_route_via(None, 'Adding original default route', self.default_gateway)
+    del_default_route(None, 'Deleting current default route', 4)
+    add_default_route_via(None, 'Adding original default route', 4, self.default_gateway)
+
+    if self.ipv6_gateway:
+      del_default_route(None, 'Deleting current default route', 6)
+      add_default_route_via(None, 'Adding original default route', 6, self.ipv6_gateway)
 
     self.set_state('state', 'down')
     return True
@@ -204,6 +221,20 @@ class VpnConfig:
     self.ssh_config.run('Configuring remote ip address', ['sudo', 'ip', 'addr', 'add', remote_cidr, 'dev', remote_device])
     self.set_state('remote_cidr', remote_cidr)
 
+    local_ipv6 = None
+    if self.ipv6_prefix:
+      ipv6_prefix = self.ipv6_prefix.strip(':')
+      ipv6_prefix_length = (1 + ipv6_prefix.count(':')) * 16
+
+      local_ipv6 = '%s::%s' % (ipv6_prefix, local_id)
+      local_ipv6_cidr = '%s/%s' % (local_ipv6, ipv6_prefix_length)
+      run_command('Configuring local ipv6 address', ['sudo', 'ip', 'addr', 'add', local_ipv6_cidr, 'dev', local_device])
+      self.set_state('local_ipv6', local_ipv6)
+
+      remote_ipv6 = '%s::%s/%s' % (ipv6_prefix, 1, ipv6_prefix_length)
+      self.ssh_config.run('Configuring remote ipv6 address', ['sudo', 'ip', 'addr', 'add', remote_ipv6, 'dev', remote_device])
+      self.set_state('remote_ipv6', remote_ipv6)
+
     # Dump some diagnostics
     # sudo ip link show ${LOCAL_TUN}
     # ssh  ${SSHUSER}@${SERVER} sudo ip link show ${REMOTE_TUN}
@@ -213,22 +244,28 @@ class VpnConfig:
     run_command('Pinging the remote IP', ['ping', '-c', '3', '172.31.254.1'])
 
     # Enable local forwarding / proxying
-	  # TODO: Integrate with applyd
+    # TODO: Integrate with applyd
     # TODO: Delete the rules when we're done
-    add_iptables_rule(self.ssh_config, 'Enabling IPv4 NAT', 'nat', '-A POSTROUTING -s 172.31.254.0/24 ! -d 172.31.254.0/24 -j MASQUERADE')
+    add_iptables_rule(self.ssh_config, 'Enabling IPv4 NAT', 4, 'nat', '-A POSTROUTING -s 172.31.254.0/24 ! -d 172.31.254.0/24 -j MASQUERADE')
 
-    add_iptables_rule(self.ssh_config, 'Enabling IPv4 forwarding to tunnel device', 'filter', '-A FORWARD -i tun2 -j ACCEPT')
-    add_iptables_rule(self.ssh_config, 'Enabling IPv4 forwarding from tunnel device', 'filter', '-A FORWARD -o tun2 -j ACCEPT')
+    add_iptables_rule(self.ssh_config, 'Enabling IPv4 forwarding to tunnel device', 4, 'filter', '-A FORWARD -i tun2 -j ACCEPT')
+    add_iptables_rule(self.ssh_config, 'Enabling IPv4 forwarding from tunnel device', 4, 'filter', '-A FORWARD -o tun2 -j ACCEPT')
 
-    # TODO: Support IPv6    
-    #ssh ${SSHUSER}@${SERVER} sudo ip6tables -A FORWARD -o ${REMOTE_TUN} -j ACCEPT
-    #ssh ${SSHUSER}@${SERVER} sudo ip6tables -A FORWARD -i ${REMOTE_TUN} -j ACCEPT
-	  #ssh ${SSHUSER}@${SERVER} sudo ip -6 neigh add proxy ${PREFIX}:${IP} dev eth0
+    if local_ipv6:
+      # TODO: Make configurable / auto-detect
+      device = 'eth0'
+      run(self.ssh_config, 'Adding IPv6 neighbour proxy', ['sudo', 'ip', '-6', 'neigh', 'add', 'proxy', local_ipv6, 'dev', device])
+      add_iptables_rule(self.ssh_config, 'Enabling IPv6 forwarding to tunnel device', 6, 'filter', '-A FORWARD -i tun2 -j ACCEPT')
+      add_iptables_rule(self.ssh_config, 'Enabling IPv6 forwarding from tunnel device', 6, 'filter', '-A FORWARD -o tun2 -j ACCEPT')
 
     # TODO: Make configurable (split routing)
-    add_route_via(None, 'Adding a route for the VPN server', self.ssh_config.host, self.default_gateway)
-    del_default_route(None, 'Deleting current default route')
-    add_default_route_dev(None, 'Adding default route via tunnel', local_device)
+    add_route_via(None, 'Adding a route for the VPN server', 4, self.ssh_config.host, self.default_gateway)
+    del_default_route(None, 'Deleting current default route', 4)
+    add_default_route_dev(None, 'Adding default route via tunnel', 4, local_device)
+
+    if local_ipv6:
+      del_default_route(None, 'Deleting current default route', 6)
+      add_default_route_dev(None, 'Adding default route via tunnel', 6, local_device)
 
     self.set_state('state', 'up')
 
@@ -240,16 +277,34 @@ def run(ssh, message, cmd):
   else:
     return run_command(message, cmd)
 
-def list_iptables_rules(ssh, ruleset):
-  out, _ = run(ssh, 'Reading state of IP tables', ['sudo', 'iptables', '-t', ruleset, '--list-rules'])
+def list_iptables_rules(ssh, protocol, ruleset):
+  args = []
+  args.append('sudo')
+  if protocol == 6:
+    args.append('ip6tables')
+  else:
+    args.append('iptables')
+  args.extend(['-t', ruleset])
+  args.append('--list-rules')
+  out, _ = run(ssh, 'Reading state of IP tables', args)
   return out.split('\n')
 
-def list_routes(ssh):
-  out, _ = run(ssh, 'Reading route table', ['sudo', 'ip', 'route'])
+def build_ip_command(protocol, command):
+  args = ['sudo', 'ip']
+  if protocol == 6:
+    args.append('-6')
+  else:
+    args.append('-4')
+  args.append(command)
+  return args
+
+def list_routes(ssh, protocol):
+  args = build_ip_command(protocol, 'route')
+  out, _ = run(ssh, 'Reading route table', args)
   return out.split('\n')
 
-def find_default_gateway():
-  routes = list_routes(None)
+def find_default_gateway(protocol):
+  routes = list_routes(None, protocol)
   for route in routes:
     # Look for a line like 'default via 1.2.3.4 ...'
     tokens = route.split()
@@ -262,16 +317,22 @@ def find_default_gateway():
     return tokens[2]
   return None
 
-def add_iptables_rule(ssh, message, ruleset, rule):
-    rules = list_iptables_rules(ssh, ruleset)
+def add_iptables_rule(ssh, message, protocol, ruleset, rule):
+    rules = list_iptables_rules(ssh, protocol, ruleset)
 
     if not rule in rules:
-      args = ['sudo', 'iptables', '-t', ruleset]
+      args = []
+      args.append('sudo')
+      if protocol == 6:
+        args.append('ip6tables')
+      else:
+        args.append('iptables')
+      args.extend(['-t', ruleset])
       args.extend(rule.split())
-      run(ssh, 'Enabling IPv4 forwarding to tunnel device', args)
+      run(ssh, message, args)
 
-def add_route_via(ssh, message, dest, via):
-  routes = list_routes(ssh)
+def add_route_via(ssh, message, protocol, dest, via):
+  routes = list_routes(ssh, protocol)
   for line in routes:
     tokens = line.split()
     if len(tokens) < 3:
@@ -283,10 +344,14 @@ def add_route_via(ssh, message, dest, via):
     if tokens[2] != via:
       continue
     return
-  run_command(message, ['sudo', 'ip', 'route', 'add', dest, 'via', via])
 
-def del_default_route(ssh, message):
-  routes = list_routes(ssh)
+  args = build_ip_command(protocol, 'route')
+  args.extend(['add', dest, 'via', via])
+
+  run_command(message, args)
+
+def del_default_route(ssh, message, protocol):
+  routes = list_routes(ssh, protocol)
   has_default = False
   for route in routes:
     tokens = route.split()
@@ -296,13 +361,20 @@ def del_default_route(ssh, message):
       continue
     has_default = True
   if has_default:
-    run_command(message, ['sudo', 'ip', 'route', 'del', 'default'])
+    args = build_ip_command(protocol, 'route')
+    args.extend(['del', 'default'])
 
-def add_default_route_via(ssh, message, via):
-  run_command(message, ['sudo', 'ip', 'route', 'add', 'default', 'via', via])
+    run_command(message, args)
 
-def add_default_route_dev(ssh, message, dev):
-  run_command(message, ['sudo', 'ip', 'route', 'add', 'default', 'dev', dev])
+def add_default_route_via(ssh, message, protocol, via):
+  args = build_ip_command(protocol, 'route')
+  args.extend(['add', 'default', 'via', via])
+  run_command(message, args)
+
+def add_default_route_dev(ssh, message, protocol, dev):
+  args = build_ip_command(protocol, 'route')
+  args.extend(['add', 'default', 'dev', dev])
+  run_command(message, args)
 
 def run_command(description, args, stdin='', **kwargs):
   print description
