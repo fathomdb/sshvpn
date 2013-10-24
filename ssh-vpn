@@ -225,8 +225,7 @@ class VpnConfig:
     #ssh ${SSHUSER}@${SERVER} sudo ip6tables -A FORWARD -i ${REMOTE_TUN} -j ACCEPT
 	  #ssh ${SSHUSER}@${SERVER} sudo ip -6 neigh add proxy ${PREFIX}:${IP} dev eth0
 
-    # TODO: Make configurable
-    # TODO: Save local route
+    # TODO: Make configurable (split routing)
     add_route_via(None, 'Adding a route for the VPN server', self.ssh_config.host, self.default_gateway)
     del_default_route(None, 'Deleting current default route')
     add_default_route_dev(None, 'Adding default route via tunnel', local_device)
