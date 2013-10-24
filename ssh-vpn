@@ -80,12 +80,15 @@ class VpnConfig:
 
     default_gateway = self.config.get('default_gateway')
     if not default_gateway:
+      default_gateway = self.get_state('default_gateway')
+    if not default_gateway:
       default_gateway = find_default_gateway()
       if not default_gateway:
         sys.stderr.write('default_gateway not configured in %s\n' % self.config_file)
         return False
       else:
         print("Auto-configured default gateway as: " + default_gateway)
+        self.set_state('default_gateway', default_gateway)
     self.default_gateway = default_gateway
 
     return True
@@ -281,7 +284,7 @@ def add_route_via(ssh, message, dest, via):
     if tokens[2] != via:
       continue
     return
-  run_command(message, ['sudo', 'ip', 'route', 'add', dist, 'via', via])
+  run_command(message, ['sudo', 'ip', 'route', 'add', dest, 'via', via])
 
 def del_default_route(ssh, message):
   routes = list_routes(ssh)
